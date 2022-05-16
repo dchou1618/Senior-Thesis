@@ -1,7 +1,160 @@
 import argparse
+import matplotlib.pyplot as plt
+import pandas as pd
+import pickle
 import numpy as np
+from joblib import Parallel, delayed
+import heapq
+from scipy import correlate
+from numba import vectorize, cuda
+
+# User-specified prediction function
 
 # predict_and_save_results_mstgcn - under lib/utils.py
+
+'''
+:param: low_bound - 
+:param: up_bound - 
+:param: val - 
+:return: bool - 
+'''
+def within_range(low_bound, up_bound, val):
+    return low_bound <= val and val <= up_bound
+
+
+'''
+:requires: Arrays first_portion and second_portion 
+should be .
+:param: first_portion - 
+:param: second_portion - 
+:param: data_vec - 
+:return: output_vec - 
+'''
+def take_diff_vecs(first_portion,second_portion,data_vec,jth):    
+    vec_shape_len = len(data_vec.shape)
+    prev_vec = data_vec[:first_portion[0],0] if vec_shape_len == 2\
+                                             else data_vec[:first_portion[0]]
+    post_vec = data_vec[(first_portion[-1]+1):, 0] if vec_shape_len == 2 else data_vec[(first_portion[-1]+1):]
+    print(len(first_portion),len(second_portion),jth)
+    new_first_indices = first_portion[:jth] + second_portion[jth:]
+    first_portion = np.take(data_vec[:,0] if vec_shape_len == 2 else data_vec, new_first_indices, axis=0)
+    output_vec = np.append(np.append(prev_vec,first_portion),post_vec)
+    return output_vec
+
+'''
+:param: first_portion - 
+:param: second_portion - 
+:param: indep_vec - 
+:param: dep_vec - 
+:param: jth - 
+:return: output_indep, output_dep - 
+'''
+
+def perturb_x_y(first_portion, second_portion, indep_vec, dep_vec, jth):
+    output_indep = take_diff_vecs(first_portion, second_portion, indep_vec, jth)
+    output_dep = take_diff_vecs(first_portion, second_portion, dep_vec, jth)
+    return output_indep, output_dep
+'''
+:param: indep_vec 
+:param: dep_vec - 
+:param: jth - 
+:param: observations_to_perturb - 
+:return: output_indep, output_dep - 2-tuple of 
+
+'''
+def mc_sample_strumbelj(indep_vec, dep_vec, jth, observations_to_perturb):
+    blocks = list(range(len(observations_to_perturb)))
+    contribution_sum = 0
+    output_vec = []
+    first, second = np.random.choice(blocks, size = 2, replace=False)
+    assert len(blocks) >= 3, "not enough blocks"
+    assert (first < second) or (first > second), "Overlapping intervals."
+    assert first != second, "indices same when not supposed to."
+    first_portion = observations_to_perturb[first]
+    second_portion = observations_to_perturb[second]
+    '''
+    plt.plot(list(range(0,first_portion[0])),dep_vec[:first_portion[0]], color="b")
+    plt.plot(first_portion,list(np.take(dep_vec, first_portion, axis=0)),color="g")
+    plt.plot(list(range(first_portion[-1]+1,second_portion[0])), dep_vec[(first_portion[-1]+1):second_portion[0]], color="b")
+    plt.plot(second_portion, list(np.take(dep_vec, second_portion, axis=0)), color="g")
+    plt.plot(list(range(second_portion[-1]+1,len(dep_vec))), dep_vec[(second_portion[-1]+1):], color="b")
+    plt.savefig('./plot.png')
+    plt.close()
+    '''
+
+    if (first < second):
+        output_indep, output_dep = perturb_x_y(first_portion, 
+                                        second_portion, indep_vec, dep_vec, jth)
+    elif (first > second):
+        output_indep, output_dep = perturb_x_y(second_portion, 
+                                               first_portion, 
+                                               indep_vec, 
+                                               dep_vec,
+                                               jth)
+    return output_indep, output_dep
+
+'''
+:param: data_vec 
+:param: jth
+:param: ref_portion
+:param: sample_type
+:return: mc_sample_strumbelj return value - 
+'''
+def sample_similar_segments(test_x_vec, test_y_vec, jth, ref_portion, sample_type):
+    if (sample_type is not None and len(sample_type) != 0):
+        return mc_sample_strumbelj(test_x_vec, test_y_vec, jth, most_similar_segments(ref_portion[0],ref_portion[1],
+                                                                test_x_vec, 10))
+    else:
+        print("No specified sample type.")
+        return []
+
+'''
+:param: input_tensor - 
+:param: dep_tensor - .
+:param: region_to_perturb - .
+:param: data_type - .
+:param: dim - .
+:param: jth - .
+:param: sample_type - .
+:return: perturbed_indep, perturbed_dep - .
+'''
+
+def perturb_func(input_tensor, dep_tensor, region_to_perturb, data_type, dim, jth, sample_type): 
+    if (dim > 4):
+        print("Dimensions greater than 4 not handled\n")
+    else:
+        result=[sample_similar_segments(input_tensor[:, i, 0:1, j], dep_tensor[:,i,j], jth,\
+                                                region_to_perturb, sample_type) for i in range(input_tensor.shape[1]) \
+                                                for j in range(input_tensor.shape[3])]
+    perturbed_indep = list(map(lambda x: x[0], result))
+    perturbed_dep = list(map(lambda x: x[1], result))
+    perturbed_indep = np.reshape(np.array(perturbed_indep, dtype=np.float64), input_tensor.shape)
+    perturbed_dep = np.reshape(np.array(perturbed_dep, dtype=np.float64), dep_tensor.shape)
+    #np.save("perturbed_indep.npy", perturbed_indep, allow_pickle=True)
+    #np.save("perturbed_dep.npy", perturbed_dep, allow_pickle=True)
+    return perturbed_indep, perturbed_dep
+
+# We modify the shape of the data after removal of portions of the data.
+# Then save the modified data into the same file.
+
+# Rather than perturbing the input data file for predictions
+# we can perturb the input tensor of time series observations.
+'''
+:param: input_tensor
+:param: data_type
+:param: dim - the dimension of the independent "input" tensor.
+:param: **kwargs - key word arguments that can either be data_entry or
+:return: result - .
+'''
+def perturb_data(input_tensor, dep_tensor, region_to_perturb, data_type, dim, M_iterations, jth, sample_type="mc_sample_strumbelj"):
+    perturbed_indep, perturbed_dep = perturb_func(input_tensor, 
+                                                  dep_tensor,
+                                                  region_to_perturb,
+                                                  data_type,
+                                                  dim,
+                                                  jth,
+                                                  sample_type)
+    return perturbed_indep, perturbed_dep
 
 # #####################################
 # Noise Reduction
@@ -63,7 +216,14 @@ def linear_smoother(ts, num_neighbors, weight_method="gaussian"):
             # rather than a weighted average of nearest data points,
             # we take ordinary average.
             pass
-    return averaged_points
+    return averaged_points 
+
+'''
+:param: shape
+:param: xlab
+:param: ylab
+:param: plt_title
+'''
 
 # Data types
 def plot(shape,xlab,ylab,plt_title):
@@ -77,7 +237,7 @@ def plot(shape,xlab,ylab,plt_title):
 '''
 :param: ts
 :param: window
-:return:
+:return: ts_points
 '''
 
 def ma(ts,window):
@@ -88,31 +248,44 @@ def ma(ts,window):
 
 '''
 :param: vec
-:return:
+:return: np.float64 - norm of the input vector
+"vec" is computed.
 '''
 
 def norm(vec):
     return np.sqrt(np.sum([x**2 for x in vec]))
 
 '''
-
 :param: vec1
 :param: vec2
-:return:
+:return: cosine similarity between the two vectors
+vec1, vec2. Using cosine similarity rather than 
+dot product for similarity due to cosine similarity
+not being dependent on vector length.
 '''
 def cosine_sim(vec1,vec2):
     return np.dot(vec1,vec2)/(norm(vec1)*norm(vec2))
 
 
 '''
-:param: vec
-:return:
+:param: vec - 
+:return: diffs - 
 '''
 def deltas(vec):
     diffs = []
     for i in range(1,len(vec)):
         diffs.append(vec[i]-vec[i-1])
     return diffs
+
+
+
+'''
+:brief: Flattens a list down to two levels.
+
+'''
+
+def flatten_lst(L):
+    return [elem for lst in L for elem in lst] 
 
 '''
 Computes the similarity between pairwise difference vectors (x_i-x_{i-1})
@@ -127,8 +300,13 @@ Computes the similarity between pairwise difference vectors (x_i-x_{i-1})
 one of k segments of the time series data "ts" most similar to
 ts[start_idx:end_idx].
 '''
+
 def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=True,avg_diff=False):
-    cmp_window = ts[start_idx:end_idx]
+    if (len(ts[start_idx:end_idx].shape) < 2):
+        cmp_window = ts[start_idx:end_idx]
+    else:
+        cmp_window = flatten_lst(ts[start_idx:end_idx])
+        ts = flatten_lst(ts)
     if compute_diff:
         cmp_window = deltas(cmp_window)
     window_size = end_idx-start_idx
@@ -137,7 +315,8 @@ def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=True,avg_diff=Fals
     num_segments = 0
     sim_to_region = dict()
     seen_segments = []
-    for i in range(window_size,len(ts)):
+    for i in range(window_size, len(ts), window_size): # we jump by window_size
+        #print("Entered")
         segment = ts[(i-window_size):i]
         if compute_diff:
             segment = deltas(segment)
@@ -145,30 +324,39 @@ def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=True,avg_diff=Fals
             sim = np.sum(np.array(cmp_window)-np.array(segment))/len(cmp_window)
         else:
             sim = correlate(cmp_window,segment)[0]
-            #sim = cosine_sim(cmp_window,segment)
-        sim = round(sim,6)
+        sim = round(sim,16)
         if len(seen_segments) != 0:
             if seen_segments[-1][-1] >= i-window_size:
                 continue
         if num_segments < k:
-            sim_to_region[sim] = list(range(i-window_size,i))
-            heapq.heappush(L,sim)
-            num_segments += 1
+            # we don't want to add duplicates
+            if (sim not in sim_to_region):
+                assert sim not in L, "sim should not be in L or sim_to_region"
+                sim_to_region[sim] = list(range(i-window_size,i))
+                heapq.heappush(L,sim)
+                num_segments += 1
+                #print(L)
         else:
             least_sim_largest_dist = heapq.nsmallest(1,L)[0]
-#             print("Keeping size:",len(L))
-#             print("least_similar",least_sim_largest_dist)
-            if sim >= least_sim_largest_dist: # number of segments exceeds k
+            if sim > least_sim_largest_dist and sim not in L: # number of segments 
+                # exceeds k if sim is added.
 #                 sim_to_region[sim] = list(range(i-window_size,i))
                 # need to remove the least similar region if similarity is greater than
                 # the least similar one in the heap.
+                #print("\nEntered segments > k:", sim_to_region.keys(), L, "Smallest: ",heapq.nsmallest(1,L), "\n")
+                del sim_to_region[least_sim_largest_dist]
+                val = heapq.heappop(L)
+                assert least_sim_largest_dist == val, "least similar not same as val" 
                 sim_to_region[sim] = list(range(i-window_size,i))
                 heapq.heappush(L,sim)
-                del sim_to_region[least_sim_largest_dist]
+                #if (least_sim_largest_dist not in sim_to_region):
+                    # print(f"sim_to_region no key {least_sim_largest_dist} {sim_to_region}")
+                # the two lines below are part of eliminating the least similar
                 # here we pop the smallest element from L.
-                heapq.heappop(L)
         seen_segments.append([i-window_size,i])
-    print(sim_to_region.keys())
+    #if (len(sim_to_region.keys()) < 2):
+    #    print(ts, start_idx,end_idx, sim_to_region, L)
+    #print("Keys and length of the dictionary",sim_to_region.keys(), len(ts), window_size)
     return list(sim_to_region.values())
 
 def plot_similar_cyclic_regions(indices, ts):
@@ -194,13 +382,6 @@ def plot_similar_cyclic_regions(indices, ts):
             plt.plot(list(range(0,index_lst[0])),ts[:index_lst[0]],color="green")
         plt.figure(figsize=(3, 3))
     plt.show()
-
-# def probe_predictions(model_params, model, train_data, test_data):
-#     initialized = model(model_params)
-#     initialized.train(train_data)
-#     predicted_data = initialized.predict(test_data)
-#     Predicted average speeds: predicted_data[:,<detector_num>,2]
-#     Plot differences between predicted and actual data
 
 if __name__ == "__main__":
     detector = 0
