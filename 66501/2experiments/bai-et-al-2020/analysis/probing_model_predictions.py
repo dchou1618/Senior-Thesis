@@ -37,15 +37,18 @@ should be .
 '''
 def take_diff_vecs(first_portion,second_portion,data_vec,jth):    
     vec_shape_len = len(data_vec.shape)
-    prev_vec = data_vec[:first_portion[0],0] if vec_shape_len == 2\
-                                             else data_vec[:first_portion[0]]
-    # we restrict the vector to only up to the start of the second portion 
-    # of the vector.
-    post_vec = data_vec[(first_portion[-1]+1):second_portion[0], 0] if vec_shape_len == 2\
-               else data_vec[(first_portion[-1]+1):second_portion[0]]
-    new_first_indices = first_portion[:jth] + second_portion[jth:]
-    first_portion = np.take(data_vec[:,0] if vec_shape_len == 2 else data_vec, new_first_indices, axis=0)
-    output_vec = np.append(np.append(prev_vec,first_portion),post_vec)
+    #prev_vec = data_vec[:first_portion[0],0] if vec_shape_len == 2\
+    #                                         else data_vec[:first_portion[0]]
+    # first_portion[-1]+1
+    between_first_and_second = data_vec[:second_portion[0],0] if vec_shape_len == 2\
+            else data_vec[:second_portion[0]]
+    # vector after the second portion.
+    post_vec = data_vec[(second_portion[-1]+1):, 0] if vec_shape_len == 2\
+               else data_vec[(second_portion[-1]+1):]
+    # first portion replacing second portion.
+    new_first_indices = second_portion[:jth] + first_portion[jth:]
+    replaced_second_portion = np.take(data_vec[:,0] if vec_shape_len == 2 else data_vec, new_first_indices, axis=0)
+    output_vec = np.append(np.append(between_first_and_second,replaced_second_portion),post_vec)
     return output_vec
 
 '''
@@ -147,11 +150,15 @@ def sample_similar_segments(i, input_tensor, dep_tensor, jth, ref_portion, sampl
 :param: input_tensor - 
 '''
 def twelve_shifted_resampled(i, input_tensor, dep_tensor, jth, ref_portion, sample_type, top_k=15):
+    #print("Input tensor len: ", len(input_tensor))
     output = sample_similar_segments(i, input_tensor, dep_tensor, jth, ref_portion, sample_type, top_k)
-    print(len(output[0]),len(output[1]))
     if len(output) == 2:
-        return [[output[0][i:(len(input_tensor)+i)],output[1][i:(len(dep_tensor)+i)]] \
-                for i in range(12)]
+        res_input = []
+        res_output = []
+        for i in range(12):
+            res_input.append(np.array(output[0][i:(len(output[0])-(11-i) )]))
+            res_output.append(np.array(output[1][i:(len(output[1])-(11-i) )]))
+        return res_input,res_output
     else:
         print("No specified sample type for sample_similar_segments")
         return []
@@ -174,11 +181,11 @@ def perturb_func(input_tensor, dep_tensor, region_to_perturb, data_type, dim, jt
     else:
         result=[twelve_shifted_resampled(i, input_tensor, dep_tensor, jth, region_to_perturb, sample_type, 15) \
                 for i in range(input_tensor.shape[1])]
-    perturbed_indep = list(map(lambda x: x[0], result))
-    perturbed_dep = list(map(lambda x: x[1], result))
-    print(np.array(perturbed_indep).shape, input_tensor.shape, type(perturbed_indep[0]))
-    perturbed_indep = np.reshape(np.array(perturbed_indep, dtype=list), input_tensor.shape)
-    perturbed_dep = np.reshape(np.array(perturbed_dep, dtype=np.float64), dep_tensor.shape)
+    perturbed_indep = flatten_lst(list(map(lambda x: x[0], result)))
+    perturbed_dep = flatten_lst(list(map(lambda x: x[1], result)))
+    np_indep = np.array(np.concatenate(perturbed_indep,axis=None), dtype=np.float64)
+    perturbed_indep = np.reshape(np_indep, input_tensor.shape)
+    perturbed_dep = np.reshape(np.array(np.concatenate(perturbed_dep,axis=None), dtype=np.float64), dep_tensor.shape)
     return perturbed_indep, perturbed_dep
 
 # We modify the shape of the data after removal of portions of the data.
@@ -366,49 +373,55 @@ def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=False,avg_diff=Fal
     num_segments = 0
     seen_segments = []
     sim_to_region = dict()
-    for size in range(window_size,int(prop_longer*window_size)):
-        lower_upper_bound, upper_lower_bound = start_idx, end_idx
-        intervals = []
-        while (lower_upper_bound >= size):
-            intervals.append((lower_upper_bound-size,lower_upper_bound))
-            lower_upper_bound -= size
-        while (upper_lower_bound+size < len(ts)):
-            intervals.append((upper_lower_bound, upper_lower_bound+size))
-            upper_lower_bound += size
-        # ..,lower_upper_bound][][upper_lower_bound...
-        for interval_window in intervals: # we jump by window_size
-            segment = ts[interval_window[0]:interval_window[1]]
-            if compute_diff:
-                segment = deltas(segment)
-            if avg_diff:
-                assert len(cmp_window) == len(segment), "segment of interest compared to cmp_window"
-                sim = np.sum(np.array(cmp_window)-np.array(segment))/len(cmp_window)
-            else:
-                sim = correlate(cmp_window,segment)[0]
-            sim = round(sim,16)
-            if len(seen_segments) != 0:
-                if seen_segments[-1][-1] >= i-size:
-                    continue
-            if num_segments < k:
-                # we don't want to add duplicates
-                if (sim not in sim_to_region):
-                    assert sim not in L, "sim should not be in L or sim_to_region"
-                    sim_to_region[sim] = list(range(interval_window[0],interval_window[1]))
-                    heapq.heappush(L,sim)
-                    num_segments += 1
-            else:
-                least_sim_largest_dist = heapq.nsmallest(1,L)[0]
-                if sim > least_sim_largest_dist and sim not in L: # number of segments 
-                    # need to remove the least similar region if similarity is greater than
-                    # the least similar one in the heap.
-                    del sim_to_region[least_sim_largest_dist]
-                    val = heapq.heappop(L)
-                    assert least_sim_largest_dist == val, "least similar not same as val" 
-                    sim_to_region[sim] = list(range(interval_window[0],interval_window[1]))
-                    heapq.heappush(L,sim)
-                    # the two lines below are part of eliminating the least similar
-                    # here we pop the smallest element from L.
+    lower_upper_bound, upper_lower_bound = start_idx, end_idx
+    intervals = []
+    while (lower_upper_bound >= window_size):
+        intervals.append((lower_upper_bound-window_size,lower_upper_bound))
+        lower_upper_bound -= window_size
+    while (upper_lower_bound+window_size < len(ts)):
+        intervals.append((upper_lower_bound, upper_lower_bound+window_size))
+        upper_lower_bound += window_size
+    # ..,lower_upper_bound][][upper_lower_bound...
+    for interval_window in intervals: # we jump by window_size
+        segment = ts[interval_window[0]:interval_window[1]]
+        if compute_diff:
+            segment = deltas(segment)
+        if avg_diff:
+            assert len(cmp_window) == len(segment), "segment of interest compared to cmp_window"
+            sim = np.sum(np.array(cmp_window)-np.array(segment))/len(cmp_window)
+        else:
+            sim = correlate(cmp_window,segment)[0]
+        sim = round(sim,16)
+        if len(seen_segments) != 0:
+            if seen_segments[-1][-1] >= i-window_size:
+                continue
+        if num_segments < k:
+            # we don't want to add duplicates
+            if (sim not in sim_to_region):
+                assert sim not in L, "sim should not be in L or sim_to_region"
+                sim_to_region[sim] = list(range(interval_window[0],interval_window[1]))
+                heapq.heappush(L,sim)
+                num_segments += 1
+        else:
+            least_sim_largest_dist = heapq.nsmallest(1,L)[0]
+            if sim > least_sim_largest_dist and sim not in L: # number of segments 
+                # need to remove the least similar region if similarity is greater than
+                # the least similar one in the heap.
+                del sim_to_region[least_sim_largest_dist]
+                val = heapq.heappop(L)
+                assert least_sim_largest_dist == val, "least similar not same as val" 
+                sim_to_region[sim] = list(range(interval_window[0],interval_window[1]))
+                heapq.heappush(L,sim)
+                # the two lines below are part of eliminating the least similar
+                # here we pop the smallest element from L.
     return list(sim_to_region.values())
+
+
+'''
+:brief:
+:param: indices - 
+:param: ts - 
+'''
 
 def plot_similar_cyclic_regions(indices, ts):
     indices = sorted(indices, key=lambda x: x[0])
