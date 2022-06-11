@@ -39,14 +39,23 @@ def take_diff_vecs(first_portion,second_portion,data_vec,jth):
     vec_shape_len = len(data_vec.shape)
     #prev_vec = data_vec[:first_portion[0],0] if vec_shape_len == 2\
     #                                         else data_vec[:first_portion[0]]
-    # first_portion[-1]+1
     between_first_and_second = data_vec[:second_portion[0],0] if vec_shape_len == 2\
             else data_vec[:second_portion[0]]
     # vector after the second portion.
     post_vec = data_vec[(second_portion[-1]+1):, 0] if vec_shape_len == 2\
                else data_vec[(second_portion[-1]+1):]
     # first portion replacing second portion.
-    new_first_indices = second_portion[:jth] + first_portion[jth:]
+    if (len(first_portion) > len(second_portion)):
+        new_first_indices = first_portion[:len(second_portion)]
+    elif (len(first_portion) < len(second_portion)):
+        curr_len = 0
+        new_first_indices = []
+        while (curr_len+len(first_portion) < len(second_portion)):
+            new_first_indices += first_portion
+            curr_len += len(first_portion)
+        new_first_indices += first_portion[:(len(second_portion)-curr_len)]
+    else:
+        new_first_indices = second_portion[:jth] + first_portion[jth:]
     replaced_second_portion = np.take(data_vec[:,0] if vec_shape_len == 2 else data_vec, new_first_indices, axis=0)
     output_vec = np.append(np.append(between_first_and_second,replaced_second_portion),post_vec)
     return output_vec
@@ -101,7 +110,7 @@ def mc_sample_strumbelj(indep_vec, dep_vec, jth, observations_to_perturb):
     assert first != second, "indices same when not supposed to."
     first_portion = observations_to_perturb[first]
     second_portion = observations_to_perturb[second]
-    #print("Portions extracted:",first_portion, second_portion)
+
     if (first < second):
         #visualize_resampled_portions(dep_vec, first_portion, second_portion)
         output_indep, output_dep = perturb_x_y(first_portion, 
@@ -359,7 +368,7 @@ one of k segments of the time series data "ts" most similar to
 ts[start_idx:end_idx].
 '''
 
-def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=False,avg_diff=False,prop_longer=1.25):
+def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=False,avg_diff=False):
     if (len(ts[start_idx:end_idx].shape) < 2):
         cmp_window = ts[start_idx:end_idx]
     else:
@@ -375,12 +384,24 @@ def most_similar_segments(start_idx,end_idx,ts,k,compute_diff=False,avg_diff=Fal
     sim_to_region = dict()
     lower_upper_bound, upper_lower_bound = start_idx, end_idx
     intervals = []
-    while (lower_upper_bound >= window_size):
-        intervals.append((lower_upper_bound-window_size,lower_upper_bound))
-        lower_upper_bound -= window_size
-    while (upper_lower_bound+window_size < len(ts)):
-        intervals.append((upper_lower_bound, upper_lower_bound+window_size))
-        upper_lower_bound += window_size
+    curr_size = window_size
+    while (lower_upper_bound >= curr_size):
+        intervals.append((lower_upper_bound-curr_size,lower_upper_bound))
+        lower_upper_bound -= curr_size
+        curr_size = np.random.geometric(p=(1/window_size))
+        while (curr_size < 11):
+            curr_size = np.random.geometric(p=(1/window_size))
+    if (lower_upper_bound >= 11):
+        intervals.append((0,lower_upper_bound))
+    curr_size = window_size
+    while (upper_lower_bound+curr_size < len(ts)):
+        intervals.append((upper_lower_bound, upper_lower_bound+curr_size))
+        upper_lower_bound += curr_size
+        curr_size = np.random.geometric(p=(1/window_size))
+        while (curr_size < 11):
+            curr_size = np.random.geometric(p=(1/window_size))
+    if (len(ts)-upper_lower_bound >= 11):
+        intervals.append((upper_lower_bound,len(ts)))
     # ..,lower_upper_bound][][upper_lower_bound...
     for interval_window in intervals: # we jump by window_size
         segment = ts[interval_window[0]:interval_window[1]]
@@ -427,7 +448,6 @@ def plot_similar_cyclic_regions(indices, ts):
     indices = sorted(indices, key=lambda x: x[0])
     lsts_idx_excluded = []
     curr_end = None
-    plt.plot(list(range(250)),pems8_data[250:500,0,0],color="yellow")
     plt.figure(figsize=(3, 3))
     # we assume non-overlapping indices
     for i,index_lst in enumerate(indices):
@@ -536,15 +556,27 @@ def get_consecutive_diffs(threshold, diffs,look_at_positive_diffs=True):
         return ((cons_seq_pos+1)/len(diffs)) >= threshold
     return ((cons_seq_neg+1)/len(diffs)) >= threshold
 
+'''
+:brief: find_max_min_changes - 
+:param: vec - 
+:param: length - 
+:param: k - 
+:param: threshold - the minimum number of consecutive 
+:param: neighbors - the number of neighbors to average 
+when computing the smoothed points that are used in finding the regions with 
+highest and lowest rates of change (meant to denoise).
+'''
+
 # basic algorithm from thesis writeup.
-def find_max_min_changes(vec, length, k):
+def find_max_min_changes(vec, length, k, threshold=0.6, neighbors=15, is_smallest=False):
     optim_changes = []
     heapq.heapify(optim_changes)
     for i in range(length, len(vec)):
         diffs = deltas(np.array(vec[(i-length):i]))
-        smoothed_points = linear_smoother(diffs, 15)[1]
-        if get_consecutive_diffs(0.6, smoothed_points):
-            euclidean_norm = np.sqrt(np.sum(np.square(np.array(diffs))))
+        smoothed_points = linear_smoother(diffs, neighbors)[1]
+        if get_consecutive_diffs(threshold, smoothed_points):
+            diffs = list(filter(lambda x: x >= 0, diffs))
+            euclidean_norm = (-1 if is_smallest else 1)*np.sqrt(np.sum(np.square(np.array(diffs))))
             if len(optim_changes) < k:
                 heapq.heappush(optim_changes, [i-length, i, euclidean_norm])
             else:
